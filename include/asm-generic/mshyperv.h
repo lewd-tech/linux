@@ -25,6 +25,23 @@
 #include <asm/ptrace.h>
 #include <asm/hyperv-tlfs.h>
 
+#include <linux/interrupt.h>
+#include <linux/clocksource.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <asm/hyperv-tlfs.h>
+
+/*
+ * Hyper-V always runs with a page size of 4096. These definitions
+ * are used when communicating with Hyper-V using guest physical
+ * pages and guest physical page addresses, since the guest page
+ * size may not be 4096 on ARM64.
+ */
+#define HV_HYP_PAGE_SIZE	4096
+#define HV_HYP_PAGE_SHIFT	12
+#define HV_HYP_PAGE_MASK	(~(HV_HYP_PAGE_SIZE - 1))
+
+
 struct ms_hyperv_info {
 	u32 features;
 	u32 misc_features;
@@ -40,6 +57,30 @@ extern u64 hv_do_fast_hypercall8(u16 control, u64 input8);
 
 
 /* Generate the guest OS identifier as described in the Hyper-V TLFS */
+/*
+ * The guest OS needs to register the guest ID with the hypervisor.
+ * The guest ID is a 64 bit entity and the structure of this ID is
+ * specified in the Hyper-V specification:
+ *
+ * msdn.microsoft.com/en-us/library/windows/hardware/ff542653%28v=vs.85%29.aspx
+ *
+ * While the current guideline does not specify how Linux guest ID(s)
+ * need to be generated, our plan is to publish the guidelines for
+ * Linux and other guest operating systems that currently are hosted
+ * on Hyper-V. The implementation here conforms to this yet
+ * unpublished guidelines.
+ *
+ *
+ * Bit(s)
+ * 63 - Indicates if the OS is Open Source or not; 1 is Open Source
+ * 62:56 - Os Type; Linux is 0x100
+ * 55:48 - Distro specific identification
+ * 47:16 - Linux kernel version number
+ * 15:0  - Distro specific identification
+ *
+ * Generate the guest ID based on the guideline described above.
+ */
+
 static inline  __u64 generate_guest_id(__u64 d_info1, __u64 kernel_version,
 				       __u64 d_info2)
 {
@@ -74,11 +115,14 @@ static inline void vmbus_signal_eom(struct hv_message *msg, u32 old_msg_type)
 	/*
 	 * The cmxchg() above does an implicit memory barrier to
 	 * ensure the write to MessageType (ie set to
+	 * Make sure the write to MessageType (ie set to
 	 * HVMSG_NONE) happens before we read the
 	 * MessagePending and EOMing. Otherwise, the EOMing
 	 * will not deliver any more messages since there is
 	 * no empty slot
 	 */
+	mb();
+
 	if (msg->header.message_flags.msg_pending) {
 		/*
 		 * This will cause message queue rescan to
@@ -100,6 +144,8 @@ void hv_setup_crash_handler(void (*handler)(struct pt_regs *regs));
 void hv_remove_crash_handler(void);
 
 #if IS_ENABLED(CONFIG_HYPERV)
+extern struct clocksource *hyperv_cs;
+
 /*
  * Hypervisor's notion of virtual processor ID is different from
  * Linux' notion of CPU ID. This information can only be retrieved
@@ -171,12 +217,65 @@ void hyperv_cleanup(void);
 #else /* CONFIG_HYPERV */
 static inline bool hv_is_hyperv_initialized(void) { return false; }
 static inline bool hv_is_hibernation_supported(void) { return false; }
-static inline void hyperv_cleanup(void) {}
+void hyperv_report_panic(struct pt_regs *regs, long err);
+void hyperv_report_panic_msg(phys_addr_t pa, size_t size);
+bool hv_is_hyperv_initialized(void);
+void hyperv_cleanup(void);
 #endif /* CONFIG_HYPERV */
 
 #if IS_ENABLED(CONFIG_HYPERV)
 extern int hv_setup_stimer0_irq(int *irq, int *vector, void (*handler)(void));
 extern void hv_remove_stimer0_irq(int irq);
 #endif
+
+static inline u64 hv_read_tsc_page_tsc(const struct ms_hyperv_tsc_page *tsc_pg,
+				       u64 *cur_tsc)
+{
+	u64	scale, offset;
+	u32	sequence;
+
+	/*
+	 * The protocol for reading Hyper-V TSC page is specified in Hypervisor
+	 * Top-Level Functional Specification.  To get the reference time we
+	 * must do the following:
+	 * - READ ReferenceTscSequence
+	 *   A special '0' value indicates the time source is unreliable and we
+	 *   need to use something else.
+	 * - ReferenceTime =
+	 *     ((HWclock val) * ReferenceTscScale) >> 64) + ReferenceTscOffset
+	 * - READ ReferenceTscSequence again. In case its value has changed
+	 *   since our first reading we need to discard ReferenceTime and repeat
+	 *   the whole sequence as the hypervisor was updating the page in
+	 *   between.
+	 */
+	do {
+		sequence = READ_ONCE(tsc_pg->tsc_sequence);
+		/*
+		 * Make sure we read sequence before we read other values from
+		 * TSC page.
+		 */
+		smp_rmb();
+
+		scale = READ_ONCE(tsc_pg->tsc_scale);
+		offset = READ_ONCE(tsc_pg->tsc_offset);
+		*cur_tsc = hv_read_hwclock();
+
+		/*
+		 * Make sure we read sequence after we read all other values
+		 * from TSC page.
+		 */
+		smp_rmb();
+
+	} while (READ_ONCE(tsc_pg->tsc_sequence) != sequence);
+
+	return mul_u64_u64_shr(*cur_tsc, scale, 64) + offset;
+}
+
+static inline u64 hv_read_tsc_page(const struct ms_hyperv_tsc_page *tsc_pg)
+{
+	u64 cur_tsc;
+
+	return hv_read_tsc_page_tsc(tsc_pg, &cur_tsc);
+}
 
 #endif
