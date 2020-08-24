@@ -29,6 +29,22 @@ static inline u64 hv_get_register(unsigned int reg)
 }
 
 #define hv_get_raw_timer() rdtsc_ordered()
+#define hv_get_vector() HYPERVISOR_CALLBACK_VECTOR
+
+/* On x86/x64, there isn't a real IRQ to be enabled/disable */
+static inline void hv_enable_vmbus_irq(void) {}
+static inline void hv_disable_vmbus_irq(void) {}
+
+/*
+ * Reference to pv_ops must be inline so objtool
+ * detection of noinstr violations can work correctly.
+ */
+static __always_inline void hv_setup_sched_clock(void *sched_clock)
+{
+#ifdef CONFIG_PARAVIRT
+	pv_ops.time.sched_clock = sched_clock;
+#endif
+}
 
 void hyperv_vector_handler(struct pt_regs *regs);
 
