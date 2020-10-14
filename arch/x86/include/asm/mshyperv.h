@@ -55,6 +55,10 @@ typedef int (*hyperv_fill_flush_list_func)(
 	vclocks_set_used(VDSO_CLOCKMODE_HVCLOCK);
 #define hv_get_raw_timer() rdtsc_ordered()
 
+/* On x86/x64, there isn't a real IRQ to be enabled/disable */
+static inline void hv_enable_vmbus_irq(void) {}
+static inline void hv_disable_vmbus_irq(void) {}
+
 /*
  * Reference to pv_ops must be inline so objtool
  * detection of noinstr violations can work correctly.
